@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: atlascode-linux-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: atlascode-darwin-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: atlascode-darwin-x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build Release Binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package Release
+        shell: bash
+        run: |
+          STAGING="dist/${{ matrix.artifact_name }}"
+          mkdir -p "$STAGING"
+          cp target/${{ matrix.target }}/release/atlascode-inteligence-mcp "$STAGING/"
+          cp README.md "$STAGING/"
+          cp LICENSE "$STAGING/"
+          cd dist
+          tar -czf "${{ matrix.artifact_name }}.tar.gz" "${{ matrix.artifact_name }}"
+          shasum -a 256 "${{ matrix.artifact_name }}.tar.gz" > "${{ matrix.artifact_name }}.tar.gz.sha256"
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            dist/${{ matrix.artifact_name }}.tar.gz
+            dist/${{ matrix.artifact_name }}.tar.gz.sha256
+
+  publish-crates:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish to crates.io
+        if: env.CARGO_REGISTRY_TOKEN != ''
+        run: cargo publish
