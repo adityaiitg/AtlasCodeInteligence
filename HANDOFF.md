@@ -142,65 +142,52 @@ This gives exact error/configuration terms a lexical path while allowing paraphr
 Commands run successfully:
 
 ```sh
-cargo fmt
+cargo fmt --check
 cargo test
-cargo build
+cargo build --release
 ```
 
-The Rust test suite currently has five passing tests:
+The test suite consists of **6 unit tests** and **3 integration tests** (all passing):
 
-- MCP tool definitions expose search, save, and delete.
-- MCP initialized notifications produce no response.
-- Vector byte serialization and cosine similarity behave as expected.
-- Replacing an entry preserves its ID and refreshes/removes old FTS content.
-- Entries and FTS rows survive closing and reopening a SQLite database.
-
-A live binary smoke test also passed MCP `initialize` and `tools/list`, confirming JSON-RPC stdout, stderr-only diagnostics, and the advertised tool schemas.
-
-A broader live save/search/replace/restart/delete script initially found that project scope text was unintentionally searchable. The implementation was corrected by making the FTS project scope column `UNINDEXED`, and a regression test now covers the same boundary.
-
-The full live script has been rerun against a temporary database and verified:
-- `initialize` handshake succeeded.
-- `save_knowledge` stored the entry with generated UUID and valid timestamps.
-- Exact keyword search retrieved the entry with `keyword_rank: 1`.
-- Project scope search confirmed `keyword_rank: None` (not indexed in FTS).
-- Semantic paraphrase search retrieved the entry with semantic rank.
-- In-place replacement preserved entry ID and creation timestamp while updating content.
-- Process restart confirmed data persistence across server restarts.
-- Keyword search on replaced content succeeded; keyword search on obsolete content returned zero matches.
-- `delete_knowledge` removed the entry, and subsequent search confirmed complete removal.
+- Unit tests (`src/main.rs`):
+  - `exposes_search_save_and_delete_tools`: verifies MCP tool schemas and definitions.
+  - `ignores_initialized_notification`: verifies notifications produce no response.
+  - `vector_storage_round_trips_and_cosine_scores_match`: confirms byte serialization and cosine math.
+  - `deduplication_updates_existing_entry_in_place`: confirms in-place updates when matching `dedup_key`.
+  - `saving_and_replacing_updates_full_text_index`: verifies FTS5 updates on replace and isolation of unindexed scope tokens.
+  - `entries_and_fts_index_survive_reopening_database`: tests persistence across database connections.
+- End-to-end integration tests over stdio pipes (`tests/mcp_integration.rs`):
+  - `test_mcp_binary_full_lifecycle`: exercises binary spawn, `initialize`, `tools/list`, save, exact keyword search, unindexed scope search isolation, semantic paraphrase search, in-place replace, server kill/restart persistence, delete, and post-delete verification.
+  - `test_mcp_automatic_deduplication`: tests automatic in-place deduplication when saving with identical title and project scope, preserving entry ID and creation timestamp.
+  - `test_mcp_offline_lexical_only_mode`: tests `ATLAS_CODE_INTELIGENCE_OFFLINE=1` running strictly without network/embeddings using SQLite FTS5 BM25 retrieval.
 
 ## 7. Current Git state
 
-Initial commit:
+Recent commits:
 
 ```text
+8e19de6 Fix FTS project scope indexing, candidate rank filtering, and document live verification
 704f29c Initial AtlasCodeInteligence MCP server
 ```
 
-The uncommitted follow-up changes:
-- `src/mcp.rs`: restrict lexical ranks to eligible filtered candidate IDs.
-- `src/store.rs`: mark `project_scope` as `UNINDEXED` in `knowledge_fts`.
-- `HANDOFF.md`: updated documentation of live testing and verification.
+Recent improvements:
+- `src/embedder.rs`: Added offline and lexical-only mode support via `ATLAS_CODE_INTELIGENCE_OFFLINE` / `ATLAS_CODE_INTELIGENCE_LEXICAL_ONLY`, graceful fallback with clear diagnostics, and optional enforcement via `ATLAS_CODE_INTELIGENCE_REQUIRE_SEMANTIC`.
+- `src/store.rs`: Added `dedup_key` schema migration with partial unique index, automatic deduplication in `save()`, `generate_dedup_key()` canonical slugifier, and unit tests.
+- `src/mcp.rs`: Exposed `dedup_key` in MCP tool schema, supported automatic deduplication and reporting, added positive similarity thresholding (`sim > 0.0`), and added `"lexical_only"` ranking label when offline.
+- `tests/mcp_integration.rs`: Added comprehensive stdio JSON-RPC integration test suite covering full lifecycle, deduplication, and offline mode.
+- `README.md`: Documented offline/lexical configurations, deduplication keys, and build/test workflows.
 
 ## 8. Known limitations
 
-- First semantic save/search requires network access to download the Hugging Face model.
-- There is no explicit lexical-only fallback if model download fails.
-- The model is loaded lazily and held in process memory after first use.
-- Search currently compares the query vector with every eligible stored vector; this is appropriate for a small local store but will need an ANN/vector index for larger collections.
-- Replacement intentionally discards prior revisions.
-- No automatic deduplication or canonical workflow key exists.
-- No authentication, encryption, remote sync, tenancy, or conflict resolution exists.
+- The embedding model is loaded lazily on first semantic search/save and held in process memory.
+- Search compares the query vector with every eligible stored vector in memory; this is fast (<1ms) for small-to-medium stores but will benefit from an ANN/vector index when exceeding thousands of entries.
+- Replacement in place intentionally discards prior revisions (no audit log table yet).
+- No authentication, encryption, remote sync, multi-user tenancy, or conflict resolution exists (local single-user MCP design).
 - The database path is local to the host running the MCP process.
 
 ## 9. Recommended next steps
 
-1. Rerun a live temporary-database flow: save, exact keyword search, paraphrase search, replace, restart, search again, delete, and confirm removal.
-2. Commit `src/mcp.rs`, `src/store.rs`, and `HANDOFF.md`.
-3. Decide repository visibility, license, and whether to publish a GitHub remote.
-4. Add a lexical-only mode for offline operation and clearer model-download errors.
-5. Add a stable deduplication key such as project plus normalized title/error signature.
-6. Add optional revision history if auditability becomes more important than replacement simplicity.
-7. Add an integration test that launches the binary and exercises JSON-RPC over pipes.
-8. Consider an approximate nearest-neighbor index or SQLite vector extension when the store grows beyond a few thousand entries.
+1. Commit the offline mode, deduplication, integration tests, and updated documentation.
+2. Decide repository visibility, license (e.g. MIT, Apache-2.0), and whether to publish to a GitHub remote.
+3. Add optional revision history if auditability becomes more important than replacement simplicity.
+4. Consider an approximate nearest-neighbor index or SQLite vector extension when the store grows beyond a few thousand entries.

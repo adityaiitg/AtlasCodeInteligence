@@ -8,26 +8,68 @@ use tokenizers::Tokenizer;
 
 pub const MODEL_ID: &str = "minishlab/potion-code-16M-v2";
 
+enum ModelState {
+    Unloaded,
+    Loaded(Inner),
+    Disabled,
+}
+
 pub struct Model2Vec {
-    model: Mutex<Option<Inner>>,
+    model: Mutex<ModelState>,
 }
 
 impl Model2Vec {
     pub fn new() -> Self {
+        let is_offline = std::env::var("ATLAS_CODE_INTELIGENCE_OFFLINE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+            || std::env::var("ATLAS_CODE_INTELIGENCE_LEXICAL_ONLY")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+
+        let initial_state = if is_offline {
+            eprintln!("AtlasCodeInteligence: Lexical-only mode active (semantic embeddings disabled via environment)");
+            ModelState::Disabled
+        } else {
+            ModelState::Unloaded
+        };
+
         Self {
-            model: Mutex::new(None),
+            model: Mutex::new(initial_state),
         }
     }
 
-    pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
+    pub fn embed(&self, text: &str) -> Result<Option<Vec<f32>>> {
         let mut model = self
             .model
             .lock()
             .map_err(|error| anyhow!("Embedding model lock poisoned: {error}"))?;
-        if model.is_none() {
-            *model = Some(Inner::load().context("Loading embedding model")?);
+        match &mut *model {
+            ModelState::Disabled => Ok(None),
+            ModelState::Loaded(inner) => inner.encode(text).map(Some),
+            ModelState::Unloaded => match Inner::load() {
+                Ok(inner) => {
+                    let vec = inner.encode(text)?;
+                    *model = ModelState::Loaded(inner);
+                    Ok(Some(vec))
+                }
+                Err(error) => {
+                    let require_semantic = std::env::var("ATLAS_CODE_INTELIGENCE_REQUIRE_SEMANTIC")
+                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false);
+                    if require_semantic {
+                        return Err(error).context(format!(
+                            "Failed to load required embedding model '{MODEL_ID}' from Hugging Face"
+                        ));
+                    }
+                    eprintln!(
+                        "AtlasCodeInteligence warning: Could not download or load embedding model '{MODEL_ID}' from Hugging Face: {error:#}. Falling back to lexical-only mode. Set ATLAS_CODE_INTELIGENCE_LEXICAL_ONLY=1 to suppress model loading attempts."
+                    );
+                    *model = ModelState::Disabled;
+                    Ok(None)
+                }
+            },
         }
-        model.as_ref().expect("model initialized").encode(text)
     }
 }
 
@@ -45,12 +87,12 @@ impl Inner {
             .build()
             .map_err(|error| anyhow!("Connecting to Hugging Face Hub: {error}"))?;
         let repository = api.model(MODEL_ID.to_owned());
-        let model_path = repository
-            .get("model.safetensors")
-            .context("Downloading Model2Vec weights")?;
-        let tokenizer_path = repository
-            .get("tokenizer.json")
-            .context("Downloading Model2Vec tokenizer")?;
+        let model_path = repository.get("model.safetensors").with_context(|| {
+            format!("Downloading '{MODEL_ID}/model.safetensors' from Hugging Face Hub")
+        })?;
+        let tokenizer_path = repository.get("tokenizer.json").with_context(|| {
+            format!("Downloading '{MODEL_ID}/tokenizer.json' from Hugging Face Hub")
+        })?;
         let config_path = repository.get("config.json").ok();
         Self::from_files(&model_path, &tokenizer_path, config_path.as_deref())
     }

@@ -32,6 +32,8 @@ pub struct KnowledgeEntry {
     pub project_scope: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedup_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,12 +69,25 @@ impl KnowledgeStore {
                 project_scope TEXT,
                 embedding BLOB NOT NULL,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                dedup_key TEXT
             );
             CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(
                 id UNINDEXED, title, kind, context, content, verification, tags, project_scope UNINDEXED,
                 tokenize='porter unicode61'
             );",
+        )?;
+        let has_dedup_key: bool = connection
+            .prepare("PRAGMA table_info(knowledge)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(Result::ok)
+            .any(|name| name == "dedup_key");
+        if !has_dedup_key {
+            let _ = connection.execute("ALTER TABLE knowledge ADD COLUMN dedup_key TEXT", []);
+        }
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_dedup_key ON knowledge(dedup_key) WHERE dedup_key IS NOT NULL",
+            [],
         )?;
         Ok(Self { connection })
     }
@@ -88,10 +103,20 @@ impl KnowledgeStore {
         tags: &[String],
         project_scope: Option<&str>,
         embedding: &[f32],
-    ) -> Result<KnowledgeEntry> {
-        let id = entry_id
-            .map(str::to_owned)
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        dedup_key: Option<&str>,
+    ) -> Result<(KnowledgeEntry, bool)> {
+        let (id, deduplicated) = if let Some(explicit_id) = entry_id {
+            (explicit_id.to_owned(), false)
+        } else if let Some(key) = dedup_key {
+            if let Some(existing) = self.get_by_dedup_key(key)? {
+                (existing.id, true)
+            } else {
+                (Uuid::new_v4().to_string(), false)
+            }
+        } else {
+            (Uuid::new_v4().to_string(), false)
+        };
+
         let timestamp = chrono::Utc::now().to_rfc3339();
         let existing_created_at: Option<String> = self
             .connection
@@ -110,12 +135,13 @@ impl KnowledgeStore {
         let transaction = self.connection.unchecked_transaction()?;
         transaction.execute("DELETE FROM knowledge_fts WHERE id = ?1", [&id])?;
         transaction.execute(
-            "INSERT INTO knowledge (id, title, kind, context, content, verification, tags, project_scope, embedding, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            "INSERT INTO knowledge (id, title, kind, context, content, verification, tags, project_scope, embedding, created_at, updated_at, dedup_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(id) DO UPDATE SET title=excluded.title, kind=excluded.kind, context=excluded.context,
                 content=excluded.content, verification=excluded.verification, tags=excluded.tags,
-                project_scope=excluded.project_scope, embedding=excluded.embedding, updated_at=excluded.updated_at",
-            params![id, title, kind.as_str(), context, content, verification, tags_json, project_scope, embedding_bytes, created_at, timestamp],
+                project_scope=excluded.project_scope, embedding=excluded.embedding, updated_at=excluded.updated_at,
+                dedup_key=excluded.dedup_key",
+            params![id, title, kind.as_str(), context, content, verification, tags_json, project_scope, embedding_bytes, created_at, timestamp, dedup_key],
         )?;
         transaction.execute(
             "INSERT INTO knowledge_fts (id, title, kind, context, content, verification, tags, project_scope)
@@ -123,7 +149,8 @@ impl KnowledgeStore {
             params![id, title, kind.as_str(), context, content, verification, tags.join(" "), project_scope.unwrap_or("")],
         )?;
         transaction.commit()?;
-        self.get(&id)?.context("Saved entry disappeared")
+        let entry = self.get(&id)?.context("Saved entry disappeared")?;
+        Ok((entry, deduplicated))
     }
 
     pub fn delete(&self, id: &str) -> Result<bool> {
@@ -137,7 +164,7 @@ impl KnowledgeStore {
     pub fn get(&self, id: &str) -> Result<Option<KnowledgeEntry>> {
         self.connection
             .query_row(
-                "SELECT id, title, kind, context, content, verification, tags, project_scope, created_at, updated_at
+                "SELECT id, title, kind, context, content, verification, tags, project_scope, created_at, updated_at, dedup_key
                  FROM knowledge WHERE id = ?1",
                 [id],
                 row_to_entry,
@@ -146,13 +173,25 @@ impl KnowledgeStore {
             .context("Reading knowledge entry")
     }
 
+    pub fn get_by_dedup_key(&self, dedup_key: &str) -> Result<Option<KnowledgeEntry>> {
+        self.connection
+            .query_row(
+                "SELECT id, title, kind, context, content, verification, tags, project_scope, created_at, updated_at, dedup_key
+                 FROM knowledge WHERE dedup_key = ?1",
+                [dedup_key],
+                row_to_entry,
+            )
+            .optional()
+            .context("Reading knowledge entry by dedup_key")
+    }
+
     pub fn all(
         &self,
         project: Option<&str>,
         tags: &[String],
     ) -> Result<Vec<(KnowledgeEntry, Vec<f32>)>> {
         let mut statement = self.connection.prepare(
-            "SELECT id, title, kind, context, content, verification, tags, project_scope, embedding, created_at, updated_at
+            "SELECT id, title, kind, context, content, verification, tags, project_scope, embedding, created_at, updated_at, dedup_key
              FROM knowledge ORDER BY updated_at DESC",
         )?;
         let entries = statement
@@ -168,6 +207,7 @@ impl KnowledgeStore {
                     project_scope: row.get(7)?,
                     created_at: row.get(9)?,
                     updated_at: row.get(10)?,
+                    dedup_key: row.get(11)?,
                 };
                 let vector = bytes_to_vector(&row.get::<_, Vec<u8>>(8)?);
                 Ok((entry, vector))
@@ -209,6 +249,33 @@ impl KnowledgeStore {
     }
 }
 
+pub fn generate_dedup_key(project_scope: Option<&str>, title: &str) -> String {
+    let scope = project_scope
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("global");
+    let normalized_title = title
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>();
+    let mut cleaned_title = String::with_capacity(normalized_title.len());
+    let mut prev_dash = false;
+    for c in normalized_title.chars() {
+        if c == '-' {
+            if !prev_dash && !cleaned_title.is_empty() {
+                cleaned_title.push('-');
+                prev_dash = true;
+            }
+        } else {
+            cleaned_title.push(c);
+            prev_dash = false;
+        }
+    }
+    let cleaned_title = cleaned_title.trim_end_matches('-');
+    format!("{scope}:{cleaned_title}")
+}
+
 fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<KnowledgeEntry> {
     Ok(KnowledgeEntry {
         id: row.get(0)?,
@@ -221,6 +288,7 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<KnowledgeEntry> {
         project_scope: row.get(7)?,
         created_at: row.get(8)?,
         updated_at: row.get(9)?,
+        dedup_key: row.get(10)?,
     })
 }
 
@@ -264,7 +332,7 @@ mod tests {
     #[test]
     fn saving_and_replacing_updates_full_text_index() {
         let store = KnowledgeStore::open(Path::new(":memory:")).unwrap();
-        let original = store
+        let (original, dedup1) = store
             .save(
                 None,
                 "Recover a failed database migration",
@@ -275,8 +343,10 @@ mod tests {
                 &["database".to_owned()],
                 Some("projectscopeuniquetoken"),
                 &[1.0, 0.0],
+                None,
             )
             .unwrap();
+        assert!(!dedup1);
         assert_eq!(
             store.keyword_search("migration", 10).unwrap()[0].0,
             original.id
@@ -286,7 +356,7 @@ mod tests {
             .unwrap()
             .is_empty());
 
-        let updated = store
+        let (updated, dedup2) = store
             .save(
                 Some(&original.id),
                 "Recover a failed database migration",
@@ -297,9 +367,10 @@ mod tests {
                 &["database".to_owned()],
                 Some("projectscopeuniquetoken"),
                 &[0.0, 1.0],
+                None,
             )
             .unwrap();
-
+        assert!(!dedup2);
         assert_eq!(updated.id, original.id);
         assert_eq!(updated.created_at, original.created_at);
         assert!(store.keyword_search("competing", 10).unwrap().is_empty());
@@ -314,6 +385,49 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn deduplication_updates_existing_entry_in_place() {
+        let store = KnowledgeStore::open(Path::new(":memory:")).unwrap();
+        let key = generate_dedup_key(Some("infra-repo"), "Deploy Helm Chart with custom values");
+        assert_eq!(key, "infra-repo:deploy-helm-chart-with-custom-values");
+
+        let (first, dedup1) = store
+            .save(
+                None,
+                "Deploy Helm Chart with custom values",
+                &EntryKind::Workflow,
+                "When updating production clusters",
+                "helm upgrade --install ...",
+                "Helm release status shows deployed",
+                &["helm".to_owned()],
+                Some("infra-repo"),
+                &[1.0, 0.0],
+                Some(&key),
+            )
+            .unwrap();
+        assert!(!dedup1);
+
+        let (second, dedup2) = store
+            .save(
+                None,
+                "Deploy Helm Chart with custom values",
+                &EntryKind::Workflow,
+                "Updated procedure for production clusters",
+                "helm upgrade --install --wait ...",
+                "All pods are in Running state",
+                &["helm".to_owned()],
+                Some("infra-repo"),
+                &[0.0, 1.0],
+                Some(&key),
+            )
+            .unwrap();
+        assert!(dedup2);
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.created_at, second.created_at);
+        assert_eq!(store.all(None, &[]).unwrap().len(), 1);
+        assert_eq!(second.content, "helm upgrade --install --wait ...");
     }
 
     #[test]
@@ -340,6 +454,7 @@ mod tests {
                     &["indexing".to_owned()],
                     None,
                     &[0.5, 0.5],
+                    None,
                 )
                 .unwrap();
         }

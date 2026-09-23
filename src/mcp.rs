@@ -72,6 +72,7 @@ fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "entry_id": { "type": "string", "description": "Existing entry ID to replace; omit to create a new entry" },
+                    "dedup_key": { "type": "string", "description": "Optional stable deduplication key (e.g. error code or normalized slug). If omitted, a key is derived from project_scope and title. Entries with matching dedup_key are updated in place." },
                     "title": { "type": "string" },
                     "kind": { "type": "string", "enum": ["workflow", "resolved_failure"] },
                     "context": { "type": "string", "description": "When to use the workflow, or the observed failure and its context" },
@@ -154,17 +155,25 @@ fn search_knowledge(
         .enumerate()
         .map(|(index, (id, _))| (id, index + 1))
         .collect::<HashMap<_, _>>();
-    let query_vector = embedder.embed(query)?;
-    let mut semantic = entries
-        .iter()
-        .map(|(entry, vector)| (entry.id.clone(), cosine_similarity(&query_vector, vector)))
-        .collect::<Vec<_>>();
-    semantic.sort_by(|left, right| right.1.total_cmp(&left.1));
-    let semantic_ranks = semantic
-        .iter()
-        .enumerate()
-        .map(|(index, (id, _))| (id.clone(), index + 1))
-        .collect::<HashMap<_, _>>();
+
+    let maybe_query_vector = embedder.embed(query)?;
+    let is_semantic_active = maybe_query_vector.is_some();
+    let semantic_ranks = if let Some(query_vector) = maybe_query_vector {
+        let mut semantic = entries
+            .iter()
+            .filter(|(_, vector)| !vector.is_empty())
+            .map(|(entry, vector)| (entry.id.clone(), cosine_similarity(&query_vector, vector)))
+            .filter(|(_, score)| *score > 0.0)
+            .collect::<Vec<_>>();
+        semantic.sort_by(|left, right| right.1.total_cmp(&left.1));
+        semantic
+            .into_iter()
+            .enumerate()
+            .map(|(index, (id, _))| (id, index + 1))
+            .collect::<HashMap<_, _>>()
+    } else {
+        HashMap::new()
+    };
 
     let mut hits = entries
         .into_iter()
@@ -189,7 +198,12 @@ fn search_knowledge(
             .then_with(|| right.entry.updated_at.cmp(&left.entry.updated_at))
     });
     hits.truncate(limit);
-    Ok(json!({ "results": hits, "count": hits.len(), "ranking": "reciprocal_rank_fusion" }))
+    let ranking = if is_semantic_active {
+        "reciprocal_rank_fusion"
+    } else {
+        "lexical_only"
+    };
+    Ok(json!({ "results": hits, "count": hits.len(), "ranking": ranking }))
 }
 
 fn save_knowledge(
@@ -209,12 +223,16 @@ fn save_knowledge(
     let tags = string_array(args.get("tags"))?;
     let project_scope = args.get("project_scope").and_then(Value::as_str);
     let entry_id = args.get("entry_id").and_then(Value::as_str);
+    let dedup_key_arg = args.get("dedup_key").and_then(Value::as_str);
+    let derived_key = crate::store::generate_dedup_key(project_scope, title);
+    let effective_dedup_key = dedup_key_arg.unwrap_or(&derived_key);
+
     let embedded_text = format!(
         "{title}\n{context}\n{content}\n{verification}\n{}",
         tags.join(" ")
     );
-    let vector = embedder.embed(&embedded_text)?;
-    let entry = store.save(
+    let vector = embedder.embed(&embedded_text)?.unwrap_or_default();
+    let (entry, deduplicated) = store.save(
         entry_id,
         title,
         &kind,
@@ -224,8 +242,9 @@ fn save_knowledge(
         &tags,
         project_scope,
         &vector,
+        Some(effective_dedup_key),
     )?;
-    Ok(json!({ "saved": true, "entry": entry }))
+    Ok(json!({ "saved": true, "deduplicated": deduplicated, "entry": entry }))
 }
 
 fn delete_knowledge(args: &Value, store: &KnowledgeStore) -> anyhow::Result<Value> {
