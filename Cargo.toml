@@ -2,7 +2,15 @@
 name = "atlascode-inteligence"
 version = "0.1.0"
 edition = "2021"
-description = "A local-first MCP server for reusable workflows and resolved engineering knowledge"
+authors = ["Aditya Pratap Singh <adsingh@zetaglobal.com>"]
+description = "A local-first Model Context Protocol (MCP) server for reusable workflows and resolved engineering knowledge"
+license = "MIT"
+repository = "https://github.com/adityaiitg/AtlasCodeInteligence"
+homepage = "https://github.com/adityaiitg/AtlasCodeInteligence"
+documentation = "https://docs.rs/atlascode-inteligence"
+readme = "README.md"
+keywords = ["mcp", "ai-agents", "vector-search", "sqlite", "simd"]
+categories = ["command-line-utilities", "development-tools"]
 
 [lib]
 name = "atlascode_inteligence"
