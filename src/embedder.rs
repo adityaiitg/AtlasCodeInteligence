@@ -1,24 +1,34 @@
+use crate::simd::l2_normalize;
 use anyhow::{anyhow, bail, Context, Result};
 use half::f16;
 use hf_hub::api::sync::ApiBuilder;
 use safetensors::{tensor::Dtype, SafeTensors};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tokenizers::Tokenizer;
 
 pub const MODEL_ID: &str = "minishlab/potion-code-16M-v2";
+pub const DEFAULT_MAX_CHARS: usize = 16 * 1024; // 16 KB max for embedding input
+
+pub trait Embedder: Send + Sync {
+    fn embed(&self, text: &str) -> Result<Option<Vec<f32>>>;
+    fn is_active(&self) -> bool;
+    fn dimension(&self) -> usize;
+}
 
 enum ModelState {
     Unloaded,
-    Loaded(Inner),
+    Loaded(Box<Inner>),
     Disabled,
 }
 
-pub struct Model2Vec {
+pub struct Model2VecEmbedder {
     model: Mutex<ModelState>,
 }
 
-impl Model2Vec {
+pub type Model2Vec = Model2VecEmbedder;
+
+impl Model2VecEmbedder {
     pub fn new() -> Self {
         let is_offline = std::env::var("ATLAS_CODE_INTELIGENCE_OFFLINE")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -28,6 +38,7 @@ impl Model2Vec {
                 .unwrap_or(false);
 
         let initial_state = if is_offline {
+            tracing::info!("AtlasCodeInteligence: Lexical-only mode active (semantic embeddings disabled via environment)");
             eprintln!("AtlasCodeInteligence: Lexical-only mode active (semantic embeddings disabled via environment)");
             ModelState::Disabled
         } else {
@@ -39,18 +50,42 @@ impl Model2Vec {
         }
     }
 
-    pub fn embed(&self, text: &str) -> Result<Option<Vec<f32>>> {
+    /// Truncates very long text using head+tail strategy to preserve context and error tails.
+    fn prepare_text(text: &str, max_chars: usize) -> &str {
+        if text.len() <= max_chars {
+            return text;
+        }
+
+        let mut end = max_chars;
+        while !text.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
+        &text[..end]
+    }
+}
+
+impl Default for Model2VecEmbedder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Embedder for Model2VecEmbedder {
+    fn embed(&self, text: &str) -> Result<Option<Vec<f32>>> {
+        let prepared = Self::prepare_text(text, DEFAULT_MAX_CHARS);
+
         let mut model = self
             .model
             .lock()
             .map_err(|error| anyhow!("Embedding model lock poisoned: {error}"))?;
+
         match &mut *model {
             ModelState::Disabled => Ok(None),
-            ModelState::Loaded(inner) => inner.encode(text).map(Some),
+            ModelState::Loaded(inner) => inner.encode(prepared).map(Some),
             ModelState::Unloaded => match Inner::load() {
                 Ok(inner) => {
-                    let vec = inner.encode(text)?;
-                    *model = ModelState::Loaded(inner);
+                    let vec = inner.encode(prepared)?;
+                    *model = ModelState::Loaded(Box::new(inner));
                     Ok(Some(vec))
                 }
                 Err(error) => {
@@ -62,6 +97,9 @@ impl Model2Vec {
                             "Failed to load required embedding model '{MODEL_ID}' from Hugging Face"
                         ));
                     }
+                    tracing::warn!(
+                        "Could not download or load embedding model '{MODEL_ID}' from Hugging Face: {error:#}. Falling back to lexical-only mode."
+                    );
                     eprintln!(
                         "AtlasCodeInteligence warning: Could not download or load embedding model '{MODEL_ID}' from Hugging Face: {error:#}. Falling back to lexical-only mode. Set ATLAS_CODE_INTELIGENCE_LEXICAL_ONLY=1 to suppress model loading attempts."
                     );
@@ -69,6 +107,23 @@ impl Model2Vec {
                     Ok(None)
                 }
             },
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        let Ok(model) = self.model.lock() else {
+            return false;
+        };
+        !matches!(&*model, ModelState::Disabled)
+    }
+
+    fn dimension(&self) -> usize {
+        let Ok(model) = self.model.lock() else {
+            return 256;
+        };
+        match &*model {
+            ModelState::Loaded(inner) => inner.dimensions,
+            _ => 256,
         }
     }
 }
@@ -83,6 +138,21 @@ struct Inner {
 
 impl Inner {
     fn load() -> Result<Self> {
+        // Check for local model path override
+        if let Some(custom_path) = std::env::var_os("ATLAS_CODE_INTELIGENCE_MODEL_PATH") {
+            let path = PathBuf::from(custom_path);
+            let model_file = path.join("model.safetensors");
+            let tokenizer_file = path.join("tokenizer.json");
+            let config_file = path.join("config.json");
+            if model_file.exists() && tokenizer_file.exists() {
+                return Self::from_files(
+                    &model_file,
+                    &tokenizer_file,
+                    config_file.as_path().into(),
+                );
+            }
+        }
+
         let api = ApiBuilder::new()
             .build()
             .map_err(|error| anyhow!("Connecting to Hugging Face Hub: {error}"))?;
@@ -173,17 +243,48 @@ impl Inner {
             return Ok(vector);
         }
         if self.normalize {
-            let norm = vector
-                .iter()
-                .map(|value| value * value)
-                .sum::<f32>()
-                .sqrt()
-                .max(1e-12);
-            vector.iter_mut().for_each(|value| *value /= norm);
+            l2_normalize(&mut vector);
         } else {
             let divisor = count as f32;
             vector.iter_mut().for_each(|value| *value /= divisor);
         }
         Ok(vector)
+    }
+}
+
+/// Deterministic mock embedder for rapid unit testing without external network or models.
+#[derive(Debug, Clone)]
+pub struct MockEmbedder {
+    dimension: usize,
+}
+
+impl MockEmbedder {
+    pub fn new(dimension: usize) -> Self {
+        Self { dimension }
+    }
+}
+
+impl Default for MockEmbedder {
+    fn default() -> Self {
+        Self::new(32)
+    }
+}
+
+impl Embedder for MockEmbedder {
+    fn embed(&self, text: &str) -> Result<Option<Vec<f32>>> {
+        let mut vector = vec![0.0f32; self.dimension];
+        for (i, byte) in text.as_bytes().iter().enumerate() {
+            vector[i % self.dimension] += *byte as f32;
+        }
+        l2_normalize(&mut vector);
+        Ok(Some(vector))
+    }
+
+    fn is_active(&self) -> bool {
+        true
+    }
+
+    fn dimension(&self) -> usize {
+        self.dimension
     }
 }

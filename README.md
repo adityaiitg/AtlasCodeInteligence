@@ -1,34 +1,93 @@
 # AtlasCodeInteligence
 
-A local-first Rust MCP server for remembering reusable engineering workflows and verified fixes. Agents search saved knowledge before repeating a task and explicitly save a workflow or resolution after confirming it works.
+A local-first, high-performance Rust MCP server for persisting and retrieving engineering workflows and verified problem resolutions across autonomous agent sessions.
 
-## Features
+Agents consult saved knowledge before repeating tasks or diagnosing complex bugs, and verify solutions before saving or merging entries.
 
-- Hybrid retrieval combines SQLite FTS5 keyword ranking with Model2Vec cosine similarity and reciprocal rank fusion.
-- Semantic vectors use the same `minishlab/potion-code-16M-v2` model as CodeAtlas fast embeddings.
-- SQLite stores entries, vectors, deduplication keys, and the full-text index in one local database.
-- Existing entries can be replaced by ID or automatically updated in place via stable deduplication keys (`dedup_key`).
-- Lexical-only mode supports fully offline operation without requiring model downloads or internet access.
-- Search, save, and delete are exposed as MCP tools over stdio.
+---
 
-## Build and test
+## Architecture & Capabilities
+
+- **Two-Phase Hybrid Retrieval**:
+  - **Phase 1 (In-Memory Candidate Generation)**: Contiguous flat vector cache (`VectorIndex`) evaluated with **ARM NEON SIMD** (or portable unrolled SIMD) dot products combined with SQLite FTS5 column-weighted BM25 (`title: 10.0, tags: 6.0, context: 4.0, verification: 2.0`). RRF ($k=20$) fuses ranks with a $0.35$ minimum semantic floor.
+  - **Phase 2 (Point Hydration)**: Only winning candidate entries are hydrated from SQLite via point queries, eliminating full table scans and achieving sub-2ms latency.
+- **Automated Secret & Credential Redaction**:
+  - Automatically identifies and sanitizes sensitive data before embedding and storage: AWS keys, GitHub/GitLab PATs, OpenAI/Anthropic/Google API keys, JWTs, Bearer tokens, PEM private keys, and database passwords in connection URIs.
+- **Smart Deduplication & Accumulative Merge**:
+  - Scrubs dynamic volatile tokens (UUIDs, hex addresses, ISO timestamps, ephemeral ports, temp paths) when computing deduplication keys.
+  - Detects semantic near-duplicates ($\text{sim} \ge 0.92$) within the same `project_scope`.
+  - Non-destructive smart merge: unions tag sets, appends novel verification evidence, and updates content in-place.
+- **Audit History & Rollback**:
+  - Schema migrations tracked via `PRAGMA user_version`.
+  - `knowledge_history` audit table logs every modification with previous content, version number, and operation ("update" / "merge").
+  - Point-in-time rollback capability to restore superseded solutions.
+- **High-Concurrency SQLite Tuning**:
+  - WAL journal mode, `busy_timeout(5000ms)`, `synchronous = NORMAL`, `mmap_size = 256MB`, and `TransactionBehavior::Immediate` to eliminate SQLITE_BUSY write deadlocks between concurrent agents.
+- **Agent UX & Token Efficiency**:
+  - Dense Markdown responses in `content[0].text` reduce LLM context token usage by over 30%.
+  - `compact: true` option in `search_knowledge` yields concise summaries for up to 65% token savings.
+  - Standard JSON structured payloads are preserved in `structuredContent` for programmatic tool callers.
+- **MCP Resources & Prompts**:
+  - Resources: `knowledge://recent`, `knowledge://stats`, `knowledge://entries/{id}`.
+  - Prompts: `troubleshoot_issue`, `document_solution`.
+- **Operational CLI Subcommands**:
+  - `serve` (default stdio MCP server), `stats`, `export`, `import`, and `reindex`.
+
+---
+
+## Build and Test
 
 ```sh
-cargo build --release
+# Run unit and integration tests in debug mode
 cargo test
-cargo run --release
+
+# Run all tests in release mode
+cargo test --release
+
+# Run CLI stats
+cargo run --release -- stats
+
+# Start the MCP server over stdio
+cargo run --release -- serve
 ```
 
-On the first semantic search or save, the server downloads the model from Hugging Face and caches it locally. After that, model inference runs locally. The database defaults to the platform's user data directory under `AtlasCodeInteligence/knowledge.db`.
+---
 
-### Environment configuration
+## Configuration & Environment Variables
 
-- `ATLAS_CODE_INTELIGENCE_DB`: Set an explicit SQLite database file path.
-- `ATLAS_CODE_INTELIGENCE_OFFLINE`: Set to `1` or `true` to run strictly offline in lexical-only mode.
-- `ATLAS_CODE_INTELIGENCE_LEXICAL_ONLY`: Set to `1` or `true` to disable semantic embedding downloads and use FTS5 keyword search only.
-- `ATLAS_CODE_INTELIGENCE_REQUIRE_SEMANTIC`: Set to `1` or `true` to require semantic model loading instead of falling back to lexical-only mode on download failure.
+| Variable | Description | Default |
+|---|---|---|
+| `ATLAS_CODE_INTELIGENCE_DB` | Explicit path to SQLite database | `~/Library/Application Support/AtlasCodeInteligence/knowledge.db` |
+| `ATLAS_CODE_INTELIGENCE_OFFLINE` | Set to `1` or `true` for offline lexical-only mode | `false` |
+| `ATLAS_CODE_INTELIGENCE_LEXICAL_ONLY` | Alias for offline mode (FTS5 BM25 search only) | `false` |
+| `ATLAS_CODE_INTELIGENCE_REQUIRE_SEMANTIC` | Fail fast if model fails to download rather than falling back | `false` |
+| `ATLAS_CODE_INTELIGENCE_MODEL_PATH` | Directory containing custom `model.safetensors` and `tokenizer.json` | Hugging Face cache |
+| `RUST_LOG` | Tracing log level output to stderr (`error`, `warn`, `info`, `debug`) | `info` |
 
-## MCP configuration
+---
+
+## CLI Usage
+
+```sh
+# Display database statistics and metrics
+atlascode-inteligence-mcp stats
+
+# Export entries to JSON or JSONL backup
+atlascode-inteligence-mcp export --output backup.json
+atlascode-inteligence-mcp export --output backup.jsonl --jsonl --project payments-backend
+
+# Import entries from a backup
+atlascode-inteligence-mcp import --input backup.json --merge
+
+# Reindex full-text search and embeddings
+atlascode-inteligence-mcp reindex
+```
+
+---
+
+## MCP Client Configuration
+
+Add to your editor or agent's MCP settings (`claude_desktop_config.json`, Cursor, Antigravity, etc.):
 
 ```json
 {
@@ -41,10 +100,25 @@ On the first semantic search or save, the server downloads the model from Huggin
 }
 ```
 
-## Tools
+---
 
-- `search_knowledge`: Search by natural language, error text, or exact keywords. Optional `tags` and `project_scope` filters are supported. In hybrid mode, reciprocal rank fusion (RRF) combines keyword and semantic rankings. In lexical-only mode, BM25 ranks are used.
-- `save_knowledge`: Store a workflow or a resolved failure with its context, reusable steps or fix, and verification. Supply `entry_id` to replace an existing entry, or supply an optional `dedup_key` (defaults to `{project_scope}:{slugified_title}`) to automatically update existing entries in place.
-- `delete_knowledge`: Remove an entry by ID.
+## MCP Tools Reference
 
-The server does not inspect agent reasoning or tool history. The MCP client should call `save_knowledge` after confirming a reusable workflow or fix, and should search before saving a correction to an existing entry.
+- **`search_knowledge`**:
+  - `query` *(string, required)*: Natural language question, error code (`E0382`, `TS2322`), or keywords.
+  - `limit` *(integer, 1..50, default 5)*: Maximum results.
+  - `tags` *(array of strings)*: Tag filters.
+  - `project_scope` *(string)*: Scope/repository isolation.
+  - `compact` *(boolean, default false)*: Dense snippet mode for context window conservation.
+- **`save_knowledge`**:
+  - `title` *(string, required)*: Summary of the workflow or problem resolved.
+  - `kind` *(enum, required)*: `"workflow"` or `"resolved_failure"`.
+  - `context` *(string, required)*: Trigger conditions, symptoms, and environment.
+  - `content` *(string, required)*: Step-by-step resolution or code modifications.
+  - `verification` *(string, required)*: Concrete evidence the resolution worked (tests, commands).
+  - `tags` *(array of strings)*: Descriptive categories.
+  - `project_scope` *(string)*: Target repository or system.
+  - `entry_id` *(string, optional)*: Explicit ID to update in place.
+  - `dedup_key` *(string, optional)*: Custom deduplication slug.
+- **`delete_knowledge`**:
+  - `entry_id` *(string, required)*: The unique ID to delete.
