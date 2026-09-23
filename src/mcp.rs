@@ -1,7 +1,7 @@
 use crate::embedder::Model2Vec;
 use crate::store::{cosine_similarity, EntryKind, KnowledgeStore, SearchHit};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const SERVER_NAME: &str = "atlascode-inteligence";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -143,9 +143,14 @@ fn search_knowledge(
         return Ok(json!({ "results": [], "count": 0 }));
     }
 
-    let lexical = store.keyword_search(query, entries.len())?;
+    let eligible_ids = entries
+        .iter()
+        .map(|(entry, _)| entry.id.as_str())
+        .collect::<HashSet<_>>();
+    let lexical = store.keyword_search(query, i64::MAX as usize)?;
     let lexical_ranks = lexical
         .into_iter()
+        .filter(|(id, _)| eligible_ids.contains(id.as_str()))
         .enumerate()
         .map(|(index, (id, _))| (id, index + 1))
         .collect::<HashMap<_, _>>();

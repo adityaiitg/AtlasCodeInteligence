@@ -70,7 +70,7 @@ impl KnowledgeStore {
                 updated_at TEXT NOT NULL
             );
             CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(
-                id UNINDEXED, title, kind, context, content, verification, tags, project_scope,
+                id UNINDEXED, title, kind, context, content, verification, tags, project_scope UNINDEXED,
                 tokenize='porter unicode61'
             );",
         )?;
@@ -273,7 +273,7 @@ mod tests {
                 "Stop the competing job and retry the migration",
                 "The migration completed and the service became healthy",
                 &["database".to_owned()],
-                Some("service-a"),
+                Some("projectscopeuniquetoken"),
                 &[1.0, 0.0],
             )
             .unwrap();
@@ -281,6 +281,10 @@ mod tests {
             store.keyword_search("migration", 10).unwrap()[0].0,
             original.id
         );
+        assert!(store
+            .keyword_search("projectscopeuniquetoken", 10)
+            .unwrap()
+            .is_empty());
 
         let updated = store
             .save(
@@ -291,7 +295,7 @@ mod tests {
                 "Pause ingestion, apply the migration, then resume ingestion",
                 "Migration and ingestion health checks both pass",
                 &["database".to_owned()],
-                Some("service-a"),
+                Some("projectscopeuniquetoken"),
                 &[0.0, 1.0],
             )
             .unwrap();
@@ -305,7 +309,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .all(Some("service-a"), &["database".to_owned()])
+                .all(Some("projectscopeuniquetoken"), &["database".to_owned()])
                 .unwrap()
                 .len(),
             1
